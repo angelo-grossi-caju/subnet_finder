@@ -37,7 +37,8 @@ class IncrementalSubnetFinder:
             subnets_response = self.ec2.describe_subnets(
                 Filters=[{'Name': 'vpc-id', 'Values': [self.vpc_id]}]
             )
-            return sorted([subnet['CidrBlock'] for subnet in subnets_response['Subnets']])
+            cidrs = [subnet['CidrBlock'] for subnet in subnets_response['Subnets']]
+            return sorted(cidrs, key=lambda x: ipaddress.ip_network(x))
         except self.ec2.exceptions.ClientError as e:
             print(f"Error getting subnets: {e}")
             return []
@@ -50,47 +51,39 @@ class IncrementalSubnetFinder:
             print(f"Error getting AZs: {e}")
             return []
 
-    def _find_last_ip(self) -> Optional[ipaddress.IPv4Address]:
+    def _get_last_subnet_end(self) -> ipaddress.IPv4Address:
         if not self.existing_subnets:
-            return None
-        
+            vpc_net = ipaddress.ip_network(self.vpc_cidr)
+            return vpc_net.network_address - 1
+            
         last_subnet = ipaddress.ip_network(self.existing_subnets[-1])
         return last_subnet.broadcast_address
 
     def find_next_subnets(self, new_prefix: int, count: int = 3) -> List[SubnetInfo]:
         vpc_net = ipaddress.ip_network(self.vpc_cidr)
-        last_ip = self._find_last_ip()
-        
-        if last_ip is None:
-            # If no existing subnets, start from the beginning of VPC CIDR
-            start_ip = vpc_net.network_address
-        else:
-            # Start from the next IP after the last subnet's broadcast address
-            start_ip = last_ip + 1
-
+        last_ip = self._get_last_subnet_end()
+        current_ip = last_ip + 1
         available_subnets = []
-        current_ip = start_ip
 
         while len(available_subnets) < count:
-            # Calculate the next subnet of desired size
             try:
                 next_net = ipaddress.ip_network(f"{current_ip}/{new_prefix}", strict=False)
                 
-                # Verify this subnet is within VPC CIDR
-                if next_net.subnet_of(vpc_net):
-                    subnet_info = SubnetInfo(
-                        cidr_block=str(next_net),
-                        network_address=str(next_net.network_address),
-                        broadcast_address=str(next_net.broadcast_address),
-                        first_usable=str(next_net.network_address + 1),
-                        last_usable=str(next_net.broadcast_address - 1),
-                        usable_ips=next_net.num_addresses - 2,
-                        suggested_az=self.available_azs[len(available_subnets) % len(self.available_azs)]
-                    )
-                    available_subnets.append(subnet_info)
-                    current_ip = next_net.broadcast_address + 1
-                else:
-                    raise ValueError(f"No more space in VPC CIDR {self.vpc_cidr} for /{new_prefix} subnets")
+                if not next_net.subnet_of(vpc_net):
+                    raise ValueError(f"No more space in VPC for /{new_prefix} subnets")
+                
+                subnet_info = SubnetInfo(
+                    cidr_block=str(next_net),
+                    network_address=str(next_net.network_address),
+                    broadcast_address=str(next_net.broadcast_address),
+                    first_usable=str(next_net.network_address + 1),
+                    last_usable=str(next_net.broadcast_address - 1),
+                    usable_ips=next_net.num_addresses - 2,
+                    suggested_az=self.available_azs[len(available_subnets) % len(self.available_azs)]
+                )
+                available_subnets.append(subnet_info)
+                current_ip = next_net.broadcast_address + 1
+                
             except ValueError as e:
                 raise ValueError(f"Error calculating next subnet: {str(e)}")
 
@@ -129,7 +122,7 @@ class IncrementalSubnetFinder:
 def main():
     if len(sys.argv) not in [3, 4]:
         print("Usage: ./subnet_finder.py <vpc-id> <subnet-prefix> [region]")
-        print("Example: ./subnet_finders.py vpc-1234567890abcdef0 27 us-east-1")
+        print("Example: ./subnet_finder.py vpc-1234567890abcdef0 27 us-east-1")
         sys.exit(1)
     
     vpc_id = sys.argv[1]
